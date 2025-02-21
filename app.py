@@ -3,95 +3,105 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import requests
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+from alpha_vantage.techindicators import TechIndicators
 
 # Set page title and layout
-st.set_page_config(page_title="Hedging Tool", layout="wide")
-st.title("🛢️ Wildwood Trading Company Hedging Tool")
-st.write("Enter your details below to get started!")
+st.set_page_config(page_title="Wildwood Hedging", layout="wide")
+st.title("Advanced Oil & Gas Hedging Tool")
 
+# ===========================================
+# 1. Fetch Historical Data (Alpha Vantage)
+# ===========================================
+@st.cache_data
+def get_historical_data(commodity, api_key):
+    symbol_map = {
+        "Brent": "BRENT",
+        "WTI": "WTI",
+        "Natural Gas": "NATGAS"
+    }
+    symbol = symbol_map.get(commodity, "BRENT")
+    
+    ti = TechIndicators(key=api_key)
+    data, _ = ti.get_bbands(symbol=symbol, interval='daily', time_period=60)
+    df = pd.DataFrame(data).iloc[::-1]
+    df['close'] = (df['Real Upper Band'].astype(float) + df['Real Lower Band'].astype(float)) / 2
+    return df['close'].values
+
+# ===========================================
+# 2. Preprocess Data for LSTM
+# ===========================================
+def prepare_data(data, n_steps=60):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data.reshape(-1, 1))
+    
+    X, y = [], []
+    for i in range(n_steps, len(scaled_data)):
+        X.append(scaled_data[i-n_steps:i, 0])
+        y.append(scaled_data[i, 0])
+    return np.array(X), np.array(y), scaler
+
+# ===========================================
+# 3. Build LSTM Model
+# ===========================================
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(50, return_sequences=False),
+        Dropout(0.2),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# ===========================================
+# 4. Streamlit App Logic
+# ===========================================
 # Sidebar Inputs
 with st.sidebar:
     st.header("Inputs")
-    production = st.number_input("Monthly Production (barrels)", min_value=1000, value=10000)
-    cost = st.number_input("Breakeven Cost ($/barrel)", min_value=30, value=50)
+    commodity = st.selectbox("Commodity", ["Brent", "WTI", "Natural Gas"])
+    production = st.number_input("Monthly Production", 1000, 1000000, 10000)
+    cost = st.number_input("Breakeven Cost ($/unit)", 30, 200, 50)
     risk = st.selectbox("Risk Tolerance", ["High", "Medium", "Low"])
-    years = st.slider("Hedging Duration (years)", min_value=1, max_value=5, value=1)
+    years = st.slider("Hedging Duration (years)", 1, 5, 1)
+    carbon_footprint = st.number_input("Carbon Footprint (tons CO2/month)", 100, 10000, 1000)
 
-# Fetch live oil prices
-api_key = "IJPZKPCXDAYWYW59"  # Replace with your Alpha Vantage API key
-url = f"https://www.alphavantage.co/query?function=BRENT&interval=monthly&apikey={api_key}"
-response = requests.get(url).json()
-current_price = float(response["data"][0]["value"])
+# Fetch live price
+api_key = st.secrets["IJPZKPCXDAYWYW59"]  # Replace with your key
+current_price = get_historical_data(commodity, api_key)[-1]
+st.write(f"Current {commodity} price: **${current_price:.2f}**")
 
-# Simulate prices over the hedging duration
-def simulate_prices(current_price, months=12, n_simulations=1000):
-    prices = np.zeros((n_simulations, months))
-    prices[:, 0] = current_price
-    for t in range(1, months):
-        drift = 0  # Risk-neutral assumption
-        volatility = 0.3  # Annualized volatility
-        shock = np.random.normal(0, 1, n_simulations)
-        prices[:, t] = prices[:, t-1] * np.exp((drift - 0.5*volatility**2)*(1/12) + volatility*np.sqrt(1/12)*shock)
-    return prices
+# AI Forecast Button
+if st.button("Generate AI Forecast"):
+    with st.spinner("Training AI model..."):
+        # Get data
+        historical_data = get_historical_data(commodity, api_key)
+        n_steps = 60
+        
+        # Prepare data
+        X, y, scaler = prepare_data(historical_data, n_steps)
+        X = X.reshape(X.shape[0], n_steps, 1)
+        
+        # Train model
+        model = build_lstm_model((n_steps, 1))
+        model.fit(X, y, epochs=20, batch_size=32, verbose=0)
+        
+        # Forecast
+        last_sequence = historical_data[-n_steps:]
+        last_sequence_scaled = scaler.transform(last_sequence.reshape(-1, 1))
+        forecast = model.predict(last_sequence_scaled.reshape(1, n_steps, 1))
+        forecast = scaler.inverse_transform(forecast)
+        
+        # Plot
+        fig, ax = plt.subplots()
+        ax.plot(historical_data[-100:], label="Historical Prices")
+        ax.scatter(len(historical_data), forecast[0][0], color='red', label="Forecast")
+        ax.set_title(f"{commodity} Price Forecast")
+        ax.legend()
+        st.pyplot(fig)
 
-months = years * 12
-prices = simulate_prices(current_price, months=months)
-
-# Calculate hedge ratio
-if risk == "High":
-    hedge_ratio = 0.6
-elif risk == "Medium":
-    hedge_ratio = 0.4
-else:
-    hedge_ratio = 0.2
-
-# Calculate hedged cash flows
-hedged_cash_flows = hedge_ratio * (75 - cost) * production + (1 - hedge_ratio) * (prices - cost) * production
-
-# Calculate risk metrics
-def calculate_risk(cash_flows):
-    var = np.percentile(cash_flows, 5)  # 5th percentile
-    cvar = cash_flows[cash_flows <= var].mean()  # Average of worst 5%
-    return var, cvar
-
-var, cvar = calculate_risk(hedged_cash_flows)
-
-# Display results
-st.subheader("Results")
-st.write(f"Current Brent crude price: **${current_price:.2f}**")
-if current_price > cost:
-    st.success(f"Hedge **{hedge_ratio*100:.0f}%** to lock in profits.")
-else:
-    st.warning(f"Hedge **{hedge_ratio*100:.0f}%** to minimize losses.")
-st.write(f"Value-at-Risk (5%): **${var:,.2f}**")
-st.write(f"Conditional Value-at-Risk: **${cvar:,.2f}**")
-
-# Create a chart
-st.subheader("Price Scenarios")
-fig, ax = plt.subplots()
-ax.plot(prices.mean(axis=0), label="Average Price Scenario")
-ax.axhline(cost, color="red", linestyle="--", label="Breakeven Cost")
-ax.set_xlabel("Time (Months)")
-ax.set_ylabel("Price ($)")
-ax.set_title("Hedging Strategy Over Time")
-ax.legend()
-st.pyplot(fig)
-
-# Save results to CSV
-results = {
-    "Production (barrels)": [production],
-    "Breakeven Cost ($/barrel)": [cost],
-    "Risk Tolerance": [risk],
-    "Hedge Ratio": [hedge_ratio],
-    "Current Price ($)": [current_price],
-    "Value-at-Risk (5%)": [var],
-    "Conditional Value-at-Risk": [cvar],
-}
-df = pd.DataFrame(results)
-df.to_csv("hedging_recommendation.csv", index=False)
-st.download_button(
-    label="Download Results",
-    data=df.to_csv(),
-    file_name="hedging_recommendation.csv",
-    mime="text/csv",
-)
+# Rest of your app (hedging logic, ESG metrics, etc.) goes here...
